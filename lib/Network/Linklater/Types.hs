@@ -71,6 +71,18 @@ data Config = Config {
   _configHookURL :: Text
   }
 
+-- | An API token, either a tester token or one obtained through
+-- OAuth.
+--
+-- See:
+--
+--  * @https://api.slack.com/docs/oauth-test-tokens@
+--
+--  * @https://api.slack.com/docs/oauth@
+newtype APIToken =
+  APIToken Text
+  deriving (Show, Eq, Ord)
+
 unformat :: Format -> Text
 unformat (FormatAt user@(User u)) = unformat (FormatUser user u)
 unformat (FormatUser (User u) t) = "<@" <> u <> "|" <> t <> ">"

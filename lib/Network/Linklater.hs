@@ -35,12 +35,15 @@ module Network.Linklater
          Format(..)
        ) where
 
-import           BasePrelude hiding ((&), lazy)
 import           Control.Lens
+import           Data.Aeson.Lens
 import           Data.Text.Strict.Lens
+import           Network.Linklater.Batteries
+import           Network.Linklater.Exceptions
 import           Network.Linklater.Types
 
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy as LazyBytes
 import qualified Network.Wai as Wai
 
 import           Data.Map (Map, fromList)
@@ -48,6 +51,7 @@ import           Data.Text (Text)
 import           Network.HTTP.Types (status200, status400, parseSimpleQuery, ResponseHeaders)
 import           Network.Wai (responseLBS, strictRequestBody, Application, Request)
 import           Network.Wreq hiding (params, headers)
+import           URI.ByteString (URI)
 
 headers :: ResponseHeaders
 headers =
@@ -57,12 +61,15 @@ responseOf :: Status -> Text -> Wai.Response
 responseOf status message =
   responseLBS status headers (message ^. (re utf8 . lazy))
 
--- | The 'say' function posts a 'Message', with a capital M, to Slack.
--- It'll, however, need a 'Config' (a.k.a. incoming token) first.
-say :: Message -> Config -> IO (Response Text)
-say message Config{..} = do
-  response <- post (_configHookURL ^. unpacked) (Aeson.encode message)
-  return (response <&> (^. strict . utf8))
+-- | I use the wreq package to post a 'Message', with a capital M, to
+-- Slack and return the HTTP response. However, I need a 'Config' (an
+-- incoming hook configured through Slack administration) first.
+--
+-- I throw a 'UnlikelyUTF8Problem' if the Slack message cannot be
+-- decoded.
+say :: (MonadThrow m, MonadIO m) => Message -> Config -> m (Response Text)
+say message Config{..} =
+  postWith _reasonableOptions (_configHookURL ^. unpacked) (Aeson.encode message) >>= _decode & liftIO
 
 -- | A bot server for people who are in a hurry. Make a function that
 -- takes a 'Command' and returns some 'Text' in 'IO' world, and we'll
@@ -72,21 +79,58 @@ slashSimple :: (Command -> IO Text) -> Application
 slashSimple f =
   slash (\command _ respond -> f command >>= (respond . responseOf status200))
 
-paramsIO :: Request -> IO (Map Text Text)
-paramsIO req = do
-  lazyBytes <- strictRequestBody req
-  let query = lazyBytes ^.. (strict . to parseSimpleQuery . traverse . to (both %~ view utf8))
-  return (fromList query)
-
 -- | A bot server! As if by magic. This acts like a 'Network.WAI'
 -- middleware: Linklater wraps around your application. (Really, it
 -- just gives you a 'Command' to work with instead of a raw HTTP
 -- request.)
 slash :: (Command -> Application) -> Application
 slash inner req respond = do
-  params <- paramsIO req
+  params <- _paramsIO req
   case commandOfParams params of
     Right command ->
       inner command req respond
     Left msg ->
       respond (responseOf status400 ("linklater: unable to parse request: " <> msg ^. packed))
+
+startRTM :: MonadIO m => APIToken -> m (Response URI)
+startRTM token =
+  startRTMWithOptions token (_reasonableOptions & authenticate)
+  where
+    authenticate =
+       (param "token" .~ [view coerced token])
+       . (param "simple_latest" .~ ["1"])
+       . (param "no_unreads" .~ ["1"])
+
+startRTMWithOptions :: MonadIO m => APIToken -> Options -> m (Response URI)
+startRTMWithOptions token options =
+  getWith options (_u "/api/rtm.start") >>= decode & liftIO
+  where
+    decode response =
+      case Aeson.decode (response ^. responseBody) of
+        Nothing -> throwM (UnlikelyURIProblem (show response))
+        Just uri -> pure (uri <$ response)
+
+----------------------------------------
+-- ~ Helpers ~
+
+-- | Disables Wreq's default behavior of throwing exceptions, which
+-- seems reckless
+_reasonableOptions :: Options
+_reasonableOptions =
+  defaults & checkStatus ?~ (\_ _ _ -> Nothing)
+
+-- | Decoding helper, throws 'UnlikelyUTF8Problem', you get it.
+_decode :: MonadThrow m => Response LazyBytes.ByteString -> m (Response Text)
+_decode response =
+  case response ^? responseBody . strict . utf8 of
+    Nothing -> throwM (UnlikelyUTF8Problem (response ^. responseBody . strict))
+    Just unicode -> pure (unicode <$ response)
+
+_paramsIO :: Request -> IO (Map Text Text)
+_paramsIO req = do
+  lazyBytes <- strictRequestBody req
+  let query = lazyBytes ^.. (strict . to parseSimpleQuery . traverse . to (both %~ view utf8))
+  return (fromList query)
+
+_u :: String -> String
+_u = ("https://slack.com" ++)
